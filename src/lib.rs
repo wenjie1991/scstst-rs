@@ -1,57 +1,92 @@
 use pyo3::prelude::*;
 use numpy::PyArray3;
-use std::collections::HashSet;
 use rayon::prelude::*;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
+use indicatif::ProgressBar;
+use num_cpus;
+use std::time::Instant;
 
-/// co_occurence function
+/// co_occurrence function
 #[pyfunction]
 fn co_occur_count(py: Python, v_x: Vec<f64>, v_y: Vec<f64>, v_radium: Vec<f64>, v_label: Vec<i32>) -> PyResult<PyObject> {
-    let n = v_x.len();
 
-        // Unique labels and indices
+    let chunk_size = 1000;
+    //let thread_num = 5;
+    let thread_num = num_cpus::get();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_num)
+        .build()
+        .unwrap();
+
+
+    let start = Instant::now();
+    let pb = ProgressBar::new(v_x.len() as u64);
+
+    // Unique labels and indices mapping
     let label_unique: HashSet<_> = v_label.iter().cloned().collect();
-    let v_unique_label: Vec<_> = label_unique.into_iter().collect();
+    let mut v_unique_label: Vec<_> = label_unique.into_iter().collect();
+    v_unique_label.sort_unstable(); // Ensure a consistent order for indexing
+    let label_map: HashMap<i32, usize> = v_unique_label.iter().enumerate().map(|(i, &l)| (l, i)).collect();
+
     let k = v_unique_label.len();
+    let l = v_radium.len();
 
     // Precompute squared radii
     let v_radium_sq: Vec<f64> = v_radium.iter().map(|x| x.powi(2)).collect();
-    let l = v_radium_sq.len();
 
-    // Shared co-occurrence matrix with Mutex for safe parallel writes
-    let co_occur_m = Arc::new(Mutex::new(vec![0; k * k * l]));
 
+    // Store coordinates for better cache locality
+    let points: Vec<(f64, f64, usize)> = v_x.into_iter()
+        .zip(v_y.into_iter())
+        .zip(v_label.into_iter())
+        .map(|((x, y), label)| (x, y, *label_map.get(&label).unwrap()))
+        .collect();
+
+    // Use an atomic vector to avoid mutex locking
+    let co_occur_m = Arc::new((0..(k * k * l)).map(|_| AtomicI32::new(0)).collect::<Vec<_>>());
 
     // Parallel computation
-    (0..n).into_par_iter().for_each(|i| {
-        let mut local_counts = vec![0; k * k * l]; // Thread-local storage
+    pool.install(|| {
+        points.par_chunks(chunk_size).for_each(|chunk| {
 
-        for j in 0..n {
-            if i != j {
-                let distance = (v_x[i] - v_x[j]).powi(2) + (v_y[i] - v_y[j]).powi(2);
+            let mut local_counts = vec![0; k * k * l]; // Thread-local storage
+            for (i, &(x_i, y_i, label_i)) in chunk.iter().enumerate() {
 
-                for r in 0..l {
-                    let radium_sq = v_radium_sq[l - r - 1];
+                for (j, &(x_j, y_j, label_j)) in points.iter().enumerate() {
+                    if i != j {
+                        let distance = (x_i - x_j).powi(2) + (y_i - y_j).powi(2);
 
-                    if distance <= radium_sq {
-                        let index = r * k * k + (v_label[i] as usize) * k + (v_label[j] as usize);
-                        local_counts[index] += 1;
-                    } else {
-                        break;
+                        for r in 0..l {
+                            if distance <= v_radium_sq[l - r - 1] {
+                                let index = r * k * k + label_i * k + label_j;
+                                local_counts[index] += 1;
+                            } else {
+                                break;
+                            }
+                        }
                     }
                 }
-            }
-        }
 
-        // Merge results into shared matrix (thread-safe)
-        let mut co_occur_m_lock = co_occur_m.lock().unwrap();
-        for i in 0..co_occur_m_lock.len() {
-            co_occur_m_lock[i] += local_counts[i];
-        }
+            }
+            // Merge results into shared atomic vector
+            for (idx, &count) in local_counts.iter().enumerate() {
+                if count > 0 {
+                    co_occur_m[idx].fetch_add(count, Ordering::Relaxed);
+                }
+            }
+            pb.inc(chunk.len() as u64);
+        });
     });
 
-    // Convert to numpy array
-    let co_occur_m_final = co_occur_m.lock().unwrap();
+    pb.finish_with_message("Finished co-occurrence computation");
+    println!("Elapsed time: {:?}", start.elapsed());
+
+    // Convert to a normal Vec<i32> for NumPy conversion
+    let co_occur_m_final: Vec<i32> = co_occur_m.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+
+    // Reshape into a 3D vector
     let co_occur_reshaped: Vec<Vec<Vec<i32>>> = (0..k)
         .map(|i| (0..k)
             .map(|j| (0..l)
@@ -60,25 +95,16 @@ fn co_occur_count(py: Python, v_x: Vec<f64>, v_y: Vec<f64>, v_radium: Vec<f64>, 
             ).collect()
         ).collect();
 
+    // Convert to NumPy array
     let array = PyArray3::from_vec3(py, &co_occur_reshaped).unwrap();
 
-    //let dict = PyDict::new(py);
-    //dict.set_item("co_occur", array)?;
-    //Ok(dict.into())
     Ok(array.into())
-}
-
-
-/// Formats the sum of two numbers as string.
-#[pyfunction]
-fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
-    Ok((a + b).to_string())
 }
 
 /// A Python module implemented in Rust.
 #[pymodule]
 fn scstat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
     m.add_function(wrap_pyfunction!(co_occur_count, m)?)?;
     Ok(())
 }
+
